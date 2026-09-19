@@ -1,0 +1,123 @@
+name: Build & Sign Release APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Custom Version Code (e.g. 2). Leave blank to auto-increment from GitHub run number.'
+        required: false
+        type: string
+        default: ''
+      version_name:
+        description: 'Custom Version Name (e.g. 1.0.1). Leave blank for default.'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build-release:
+    name: Build Signed Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradlew Executable
+        run: chmod +x gradlew
+
+      - name: Determine Version Code & Name
+        id: versioning
+        run: |
+          # Calculate Version Code
+          if [ -n "${{ github.event.inputs.version_code }}" ]; then
+            V_CODE="${{ github.event.inputs.version_code }}"
+          else
+            # Automatically increments with every GitHub Action run
+            V_CODE="${{ github.run_number }}"
+          fi
+
+          # Calculate Version Name
+          if [ -n "${{ github.event.inputs.version_name }}" ]; then
+            V_NAME="${{ github.event.inputs.version_name }}"
+          else
+            # Reads base version name from gradle.properties if available, otherwise defaults
+            BASE_VNAME=$(grep "^APP_VERSION_NAME=" gradle.properties | cut -d'=' -f2 | tr -d ' ' || echo "1.0")
+            if [ -z "$BASE_VNAME" ]; then
+              BASE_VNAME="1.0"
+            fi
+            V_NAME="${BASE_VNAME}.${{ github.run_number }}"
+          fi
+
+          echo "VERSION_CODE=$V_CODE" >> $GITHUB_ENV
+          echo "VERSION_NAME=$V_NAME" >> $GITHUB_ENV
+          echo "=========================================="
+          echo "Building Release APK with:"
+          echo "Version Code: $V_CODE"
+          echo "Version Name: $V_NAME"
+          echo "=========================================="
+
+      - name: Validate Keystore Secret
+        run: |
+          if [ -z "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::GitHub Secret 'RELEASE_KEYSTORE_BASE64' is missing!"
+            echo "Please add RELEASE_KEYSTORE_BASE64 to your GitHub Repository Secrets."
+            echo "Go to: Repository -> Settings -> Secrets and variables -> Actions -> New repository secret"
+            exit 1
+          fi
+
+      - name: Decode Release Keystore
+        run: |
+          KEYSTORE_DIR="${{ runner.temp }}"
+          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE_DIR/release-keystore.jks"
+          echo "KEYSTORE_PATH=$KEYSTORE_DIR/release-keystore.jks" >> $GITHUB_ENV
+
+      - name: Build Release APK with assembleRelease
+        env:
+          KEYSTORE_PATH: ${{ env.KEYSTORE_PATH }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || secrets.STORE_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || secrets.KEYSTORE_PASSWORD || secrets.STORE_PASSWORD }}
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+        run: |
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Verify Signed APK Exists
+        run: |
+          if ls app/build/outputs/apk/release/*.apk 1> /dev/null 2>&1; then
+            echo "Signed Release APK successfully generated:"
+            ls -lh app/build/outputs/apk/release/*.apk
+          else
+            echo "::error::Release APK was not generated in app/build/outputs/apk/release/"
+            exit 1
+          fi
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-v${{ env.VERSION_NAME }}-code${{ env.VERSION_CODE }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: Cleanup Keystore File
+        if: always()
+        run: |
+          if [ -f "${{ env.KEYSTORE_PATH }}" ]; then
+            rm -f "${{ env.KEYSTORE_PATH }}"
+            echo "Keystore file securely deleted from runner."
+          fi
